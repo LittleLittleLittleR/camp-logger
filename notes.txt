@@ -1,0 +1,31 @@
+
+Changes to be made
+- allocation should hold a category ID field
+
+
+Next steps
+1. Have code that export and import data to Google Sheets
+  - Connect to Google Sheets API and link to existing sheet
+  - Export Structure
+    - Each export/select per sheet
+    - Display in a more readable format (e.g., using headers, formatting cells)
+    - Group data by Event ID or Category ID for better organization and visual clarity
+    - Exports should not erase existing data in the sheet but rather append new data or update existing entries based on ID fields
+  - Import Structure
+    - Read data from Google Sheets and map it back to the database structure
+    - Handle data validation and error handling during import to ensure data integrity 
+    (If invalid types or missing fields are encountered, log errors and skip those entries)
+  - Compare data every 10 seconds and decide whether to update the database or the Google Sheet based on the most recent changes 
+  (e.g., using timestamps or versioning)
+
+2. Connect Database to telegram bot
+  - Set up a Telegram bot using BotFather and obtain the API token
+  - Implement READ-ONLY commands for the bot to fetch and display data from the database
+    - For example, commands like /get_events, /get_items_by_category, /get_allocations_by_day, etc.
+  - Ensure that the bot can handle user input and provide appropriate responses based on the database queries
+
+3. Deploy application to Vercel
+  - Create a new project
+  - Configure project to use the appropriate environment variables for database connection and Telegram API token
+  - Deploy the application and ensure that it is running correctly on Vercel
+  - Set up any necessary webhooks for the Telegram bot to receive updates from users
