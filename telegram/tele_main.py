@@ -1,6 +1,5 @@
 import os
 import logging
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -12,6 +11,7 @@ from .model import TelegramUpdate
 
 load_dotenv()
 logger = logging.getLogger("telegram.webhook")
+TELEGRAM_TIMEOUT_SECONDS = 15.0
 
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -51,22 +51,36 @@ def _build_telegram_api_url(method: str) -> str:
 	return f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
 
 
+async def _call_telegram_api(
+	method: str,
+	*,
+	payload: dict[str, Any] | None = None,
+	http_method: str = "post",
+) -> dict[str, Any]:
+	url = _build_telegram_api_url(method)
+
+	async with httpx.AsyncClient(timeout=TELEGRAM_TIMEOUT_SECONDS) as client:
+		if http_method == "get":
+			response = await client.get(url)
+		else:
+			response = await client.post(url, json=payload)
+
+	if response.status_code >= 400:
+		raise HTTPException(status_code=502, detail=f"Telegram {method} failed: {response.text}")
+
+	data = response.json()
+	if not data.get("ok", False):
+		raise HTTPException(status_code=502, detail=f"Telegram {method} not ok: {data}")
+
+	return data
+
+
 async def _send_telegram_message(chat_id: int, text: str) -> dict[str, Any]:
 	payload = {
 		"chat_id": chat_id,
 		"text": text,
 	}
-	async with httpx.AsyncClient(timeout=15.0) as client:
-		response = await client.post(_build_telegram_api_url("sendMessage"), json=payload)
-
-	if response.status_code >= 400:
-		raise HTTPException(status_code=502, detail=f"Telegram sendMessage failed: {response.text}")
-
-	data = response.json()
-	if not data.get("ok", False):
-		raise HTTPException(status_code=502, detail=f"Telegram sendMessage not ok: {data}")
-
-	return data
+	return await _call_telegram_api("sendMessage", payload=payload)
 
 
 def _build_webhook_url(base_url: str) -> str:
@@ -113,16 +127,7 @@ def _resolve_public_base_url(public_base_url: str | None = None) -> str:
 
 
 async def _fetch_webhook_info() -> dict[str, Any]:
-	async with httpx.AsyncClient(timeout=15.0) as client:
-		response = await client.get(_build_telegram_api_url("getWebhookInfo"))
-
-	if response.status_code >= 400:
-		raise HTTPException(status_code=502, detail=f"Telegram getWebhookInfo failed: {response.text}")
-
-	data = response.json()
-	if not data.get("ok", False):
-		raise HTTPException(status_code=502, detail=f"Telegram getWebhookInfo not ok: {data}")
-	return data
+	return await _call_telegram_api("getWebhookInfo", http_method="get")
 
 
 async def _sync_webhook_if_needed() -> None:
@@ -155,18 +160,13 @@ async def _sync_webhook_if_needed() -> None:
 		payload["secret_token"] = WEBHOOK_SECRET
 
 	try:
-		async with httpx.AsyncClient(timeout=15.0) as client:
-			response = await client.post(_build_telegram_api_url("setWebhook"), json=payload)
-
-		if response.status_code >= 400:
-			logger.error("Webhook auto-sync setWebhook failed: %s", response.text)
-			return
-
-		data = response.json()
+		data = await _call_telegram_api("setWebhook", payload=payload)
 		if data.get("ok", False):
 			logger.info("Webhook auto-sync completed: %s", target_webhook_url)
 		else:
 			logger.error("Webhook auto-sync not ok: %s", data)
+	except HTTPException as exc:
+		logger.error("Webhook auto-sync setWebhook failed: %s", exc.detail)
 	except Exception:
 		logger.exception("Webhook auto-sync failed while setting webhook")
 
@@ -308,7 +308,10 @@ async def send_test_message(chat_id: int | None = None) -> dict[str, Any]:
 				status_code=400,
 				detail="chat_id is required when TELEGRAM_DEFAULT_CHAT_ID is not configured",
 			)
-		target_chat_id = int(DEFAULT_CHAT_ID)
+		try:
+			target_chat_id = int(DEFAULT_CHAT_ID)
+		except ValueError as exc:
+			raise HTTPException(status_code=500, detail="TELEGRAM_DEFAULT_CHAT_ID must be an integer") from exc
 
 	result = await _send_telegram_message(target_chat_id, "Test message from FastAPI backend.")
 	return {"ok": True, "telegram": result}
@@ -323,14 +326,7 @@ async def set_webhook(public_base_url: str | None = None) -> dict[str, Any]:
 	}
 	if WEBHOOK_SECRET:
 		payload["secret_token"] = WEBHOOK_SECRET
-
-	async with httpx.AsyncClient(timeout=15.0) as client:
-		response = await client.post(_build_telegram_api_url("setWebhook"), json=payload)
-
-	if response.status_code >= 400:
-		raise HTTPException(status_code=502, detail=f"Telegram setWebhook failed: {response.text}")
-
-	data = response.json()
+	data = await _call_telegram_api("setWebhook", payload=payload)
 	return {
 		"ok": data.get("ok", False),
 		"webhook_url": webhook_url,
@@ -363,15 +359,7 @@ async def get_webhook_info(public_base_url: str | None = Query(default=None)) ->
 @app.post("/telegram/delete-webhook")
 async def delete_webhook(drop_pending_updates: bool = False) -> dict[str, Any]:
 	payload = {"drop_pending_updates": drop_pending_updates}
-	async with httpx.AsyncClient(timeout=15.0) as client:
-		response = await client.post(_build_telegram_api_url("deleteWebhook"), json=payload)
-
-	if response.status_code >= 400:
-		raise HTTPException(status_code=502, detail=f"Telegram deleteWebhook failed: {response.text}")
-
-	data = response.json()
-	if not data.get("ok", False):
-		raise HTTPException(status_code=502, detail=f"Telegram deleteWebhook not ok: {data}")
+	data = await _call_telegram_api("deleteWebhook", payload=payload)
 
 	return {
 		"ok": True,
