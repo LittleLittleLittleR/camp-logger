@@ -17,6 +17,15 @@ logger = logging.getLogger("telegram.webhook")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 DEFAULT_CHAT_ID = os.getenv("TELEGRAM_DEFAULT_CHAT_ID", "")
+PUBLIC_BASE_URL = os.getenv("TELEGRAM_PUBLIC_BASE_URL", "")
+VERCEL_PROJECT_PRODUCTION_URL = os.getenv("VERCEL_PROJECT_PRODUCTION_URL", "")
+VERCEL_URL = os.getenv("VERCEL_URL", "")
+AUTO_SET_WEBHOOK = os.getenv("TELEGRAM_AUTO_SET_WEBHOOK", "true").strip().lower() in {
+	"1",
+	"true",
+	"yes",
+	"on",
+}
 
 
 app = FastAPI(
@@ -24,6 +33,15 @@ app = FastAPI(
 	description="Webhook backend and utility API for Telegram bot integration.",
 	version="0.1.0",
 )
+
+
+@app.on_event("startup")
+async def startup_webhook_sync() -> None:
+	if not AUTO_SET_WEBHOOK:
+		logger.info("Webhook auto-sync disabled by TELEGRAM_AUTO_SET_WEBHOOK")
+		return
+
+	await _sync_webhook_if_needed()
 
 
 def _build_telegram_api_url(method: str) -> str:
@@ -64,6 +82,36 @@ def _build_webhook_url(base_url: str) -> str:
 	return f"{base}/telegram/webhook"
 
 
+def _discover_public_base_url() -> str | None:
+	# Priority: explicit override, then stable Vercel production URL, then deployment URL.
+	if PUBLIC_BASE_URL.strip():
+		return PUBLIC_BASE_URL.strip()
+
+	if VERCEL_PROJECT_PRODUCTION_URL.strip():
+		return f"https://{VERCEL_PROJECT_PRODUCTION_URL.strip()}"
+
+	if VERCEL_URL.strip():
+		return f"https://{VERCEL_URL.strip()}"
+
+	return None
+
+
+def _resolve_public_base_url(public_base_url: str | None = None) -> str:
+	if public_base_url and public_base_url.strip():
+		return public_base_url.strip()
+
+	discovered = _discover_public_base_url()
+	if discovered:
+		return discovered
+
+	raise HTTPException(
+		status_code=400,
+		detail=(
+			"public_base_url is required. Set TELEGRAM_PUBLIC_BASE_URL or pass public_base_url explicitly"
+		),
+	)
+
+
 async def _fetch_webhook_info() -> dict[str, Any]:
 	async with httpx.AsyncClient(timeout=15.0) as client:
 		response = await client.get(_build_telegram_api_url("getWebhookInfo"))
@@ -75,6 +123,52 @@ async def _fetch_webhook_info() -> dict[str, Any]:
 	if not data.get("ok", False):
 		raise HTTPException(status_code=502, detail=f"Telegram getWebhookInfo not ok: {data}")
 	return data
+
+
+async def _sync_webhook_if_needed() -> None:
+	if not BOT_TOKEN:
+		logger.warning("Webhook auto-sync skipped: TELEGRAM_BOT_TOKEN is not configured")
+		return
+
+	base_url = _discover_public_base_url()
+	if not base_url:
+		logger.warning(
+			"Webhook auto-sync skipped: no public base URL. Set TELEGRAM_PUBLIC_BASE_URL for deterministic behavior"
+		)
+		return
+
+	target_webhook_url = _build_webhook_url(base_url)
+
+	try:
+		info = await _fetch_webhook_info()
+		current_webhook_url = info.get("result", {}).get("url", "")
+	except Exception:
+		logger.exception("Webhook auto-sync failed while fetching webhook info")
+		return
+
+	if current_webhook_url == target_webhook_url:
+		logger.info("Webhook already up-to-date: %s", target_webhook_url)
+		return
+
+	payload: dict[str, Any] = {"url": target_webhook_url}
+	if WEBHOOK_SECRET:
+		payload["secret_token"] = WEBHOOK_SECRET
+
+	try:
+		async with httpx.AsyncClient(timeout=15.0) as client:
+			response = await client.post(_build_telegram_api_url("setWebhook"), json=payload)
+
+		if response.status_code >= 400:
+			logger.error("Webhook auto-sync setWebhook failed: %s", response.text)
+			return
+
+		data = response.json()
+		if data.get("ok", False):
+			logger.info("Webhook auto-sync completed: %s", target_webhook_url)
+		else:
+			logger.error("Webhook auto-sync not ok: %s", data)
+	except Exception:
+		logger.exception("Webhook auto-sync failed while setting webhook")
 
 
 async def _process_telegram_update(
@@ -222,10 +316,8 @@ async def send_test_message(chat_id: int | None = None) -> dict[str, Any]:
 
 @app.post("/telegram/set-webhook")
 async def set_webhook(public_base_url: str | None = None) -> dict[str, Any]:
-	if public_base_url is None:
-		raise HTTPException(status_code=400, detail="public_base_url is required")
-
-	webhook_url = _build_webhook_url(public_base_url)
+	base_url = _resolve_public_base_url(public_base_url)
+	webhook_url = _build_webhook_url(base_url)
 	payload = {
 		"url": webhook_url,
 	}
@@ -250,7 +342,10 @@ async def set_webhook(public_base_url: str | None = None) -> dict[str, Any]:
 async def get_webhook_info(public_base_url: str | None = Query(default=None)) -> dict[str, Any]:
 	data = await _fetch_webhook_info()
 	result = data.get("result", {})
-	expected_url = _build_webhook_url(public_base_url) if public_base_url else None
+	try:
+		expected_url = _build_webhook_url(_resolve_public_base_url(public_base_url))
+	except HTTPException:
+		expected_url = None
 	return {
 		"ok": True,
 		"expected_webhook_url": expected_url,
