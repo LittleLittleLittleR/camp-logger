@@ -1,4 +1,5 @@
 import os
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from database.SQLite.execute import DB_PATH, list_tables, read_table
 from .model import TelegramUpdate
 
 load_dotenv()
+logger = logging.getLogger("telegram.webhook")
 
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -47,6 +49,60 @@ async def _send_telegram_message(chat_id: int, text: str) -> dict[str, Any]:
 		raise HTTPException(status_code=502, detail=f"Telegram sendMessage not ok: {data}")
 
 	return data
+
+
+def _build_webhook_url(base_url: str) -> str:
+	selected = base_url.strip()
+	if not selected:
+		raise HTTPException(status_code=400, detail="public_base_url is required")
+	if not selected.startswith("https://"):
+		raise HTTPException(status_code=400, detail="public_base_url must start with https://")
+
+	base = selected.rstrip("/")
+	if WEBHOOK_SECRET:
+		return f"{base}/telegram/webhook/{WEBHOOK_SECRET}"
+	return f"{base}/telegram/webhook"
+
+
+async def _fetch_webhook_info() -> dict[str, Any]:
+	async with httpx.AsyncClient(timeout=15.0) as client:
+		response = await client.get(_build_telegram_api_url("getWebhookInfo"))
+
+	if response.status_code >= 400:
+		raise HTTPException(status_code=502, detail=f"Telegram getWebhookInfo failed: {response.text}")
+
+	data = response.json()
+	if not data.get("ok", False):
+		raise HTTPException(status_code=502, detail=f"Telegram getWebhookInfo not ok: {data}")
+	return data
+
+
+async def _process_telegram_update(
+	update: TelegramUpdate,
+	x_telegram_bot_api_secret_token: str | None,
+	secret_in_path: str | None,
+) -> dict[str, Any]:
+	if WEBHOOK_SECRET and secret_in_path is not None and secret_in_path != WEBHOOK_SECRET:
+		raise HTTPException(status_code=403, detail="Invalid webhook path secret")
+
+	if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+		raise HTTPException(status_code=403, detail="Invalid Telegram secret header")
+
+	message = update.message
+	if not message or not message.text:
+		logger.info("Webhook update ignored: update_id=%s reason=no-text", update.update_id)
+		return {"ok": True, "handled": False, "reason": "No text message"}
+
+	logger.info(
+		"Webhook update received: update_id=%s chat_id=%s text=%s",
+		update.update_id,
+		message.chat.id,
+		message.text,
+	)
+
+	reply_text = _handle_text_command(message.text)
+	await _send_telegram_message(chat_id=message.chat.id, text=reply_text)
+	return {"ok": True, "handled": True}
 
 
 def _help_text() -> str:
@@ -138,19 +194,15 @@ async def telegram_webhook(
 	update: TelegramUpdate,
 	x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
-	if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-		raise HTTPException(status_code=403, detail="Invalid webhook path secret")
+	return await _process_telegram_update(update, x_telegram_bot_api_secret_token, secret)
 
-	if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
-		raise HTTPException(status_code=403, detail="Invalid Telegram secret header")
 
-	message = update.message
-	if not message or not message.text:
-		return {"ok": True, "handled": False, "reason": "No text message"}
-
-	reply_text = _handle_text_command(message.text)
-	await _send_telegram_message(chat_id=message.chat.id, text=reply_text)
-	return {"ok": True, "handled": True}
+@app.post("/telegram/webhook")
+async def telegram_webhook_no_secret(
+	update: TelegramUpdate,
+	x_telegram_bot_api_secret_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+	return await _process_telegram_update(update, x_telegram_bot_api_secret_token, None)
 
 
 @app.post("/telegram/send-test")
@@ -169,11 +221,11 @@ async def send_test_message(chat_id: int | None = None) -> dict[str, Any]:
 
 
 @app.post("/telegram/set-webhook")
-async def set_webhook(public_base_url: str) -> dict[str, Any]:
-	if not public_base_url.startswith("https://"):
-		raise HTTPException(status_code=400, detail="public_base_url must start with https://")
+async def set_webhook(public_base_url: str | None = None) -> dict[str, Any]:
+	if public_base_url is None:
+		raise HTTPException(status_code=400, detail="public_base_url is required")
 
-	webhook_url = f"{public_base_url.rstrip('/')}/telegram/webhook/{WEBHOOK_SECRET}"
+	webhook_url = _build_webhook_url(public_base_url)
 	payload = {
 		"url": webhook_url,
 	}
@@ -190,6 +242,44 @@ async def set_webhook(public_base_url: str) -> dict[str, Any]:
 	return {
 		"ok": data.get("ok", False),
 		"webhook_url": webhook_url,
+		"telegram": data,
+	}
+
+
+@app.get("/telegram/webhook-info")
+async def get_webhook_info(public_base_url: str | None = Query(default=None)) -> dict[str, Any]:
+	data = await _fetch_webhook_info()
+	result = data.get("result", {})
+	expected_url = _build_webhook_url(public_base_url) if public_base_url else None
+	return {
+		"ok": True,
+		"expected_webhook_url": expected_url,
+		"current_webhook_url": result.get("url"),
+		"pending_update_count": result.get("pending_update_count"),
+		"last_error_date": result.get("last_error_date"),
+		"last_error_message": result.get("last_error_message"),
+		"has_custom_certificate": result.get("has_custom_certificate"),
+		"max_connections": result.get("max_connections"),
+		"allowed_updates": result.get("allowed_updates"),
+		"telegram": data,
+	}
+
+
+@app.post("/telegram/delete-webhook")
+async def delete_webhook(drop_pending_updates: bool = False) -> dict[str, Any]:
+	payload = {"drop_pending_updates": drop_pending_updates}
+	async with httpx.AsyncClient(timeout=15.0) as client:
+		response = await client.post(_build_telegram_api_url("deleteWebhook"), json=payload)
+
+	if response.status_code >= 400:
+		raise HTTPException(status_code=502, detail=f"Telegram deleteWebhook failed: {response.text}")
+
+	data = response.json()
+	if not data.get("ok", False):
+		raise HTTPException(status_code=502, detail=f"Telegram deleteWebhook not ok: {data}")
+
+	return {
+		"ok": True,
 		"telegram": data,
 	}
 
