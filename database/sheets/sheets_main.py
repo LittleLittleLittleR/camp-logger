@@ -8,30 +8,113 @@ from google.auth.transport.requests import AuthorizedSession
 
 
 SYNC_META_SHEET = '__sync_meta'
+SERVICE_ACCOUNT_KEYS = {
+  'type',
+  'project_id',
+  'private_key_id',
+  'private_key',
+  'client_email',
+  'client_id',
+  'auth_uri',
+  'token_uri',
+  'auth_provider_x509_cert_url',
+  'client_x509_cert_url',
+  'universe_domain',
+}
+ENV_KEY_MAP = {
+  'type': 'GOOGLE_SERVICE_ACCOUNT_TYPE',
+  'project_id': 'GOOGLE_PROJECT_ID',
+  'private_key_id': 'GOOGLE_PRIVATE_KEY_ID',
+  'private_key': 'GOOGLE_PRIVATE_KEY',
+  'client_email': 'GOOGLE_CLIENT_EMAIL',
+  'client_id': 'GOOGLE_CLIENT_ID',
+  'auth_uri': 'GOOGLE_AUTH_URI',
+  'token_uri': 'GOOGLE_TOKEN_URI',
+  'auth_provider_x509_cert_url': 'GOOGLE_AUTH_PROVIDER_X509_CERT_URL',
+  'client_x509_cert_url': 'GOOGLE_CLIENT_X509_CERT_URL',
+  'universe_domain': 'GOOGLE_UNIVERSE_DOMAIN',
+}
+REQUIRED_ENV_KEYS = {
+  'GOOGLE_PROJECT_ID',
+  'GOOGLE_PRIVATE_KEY_ID',
+  'GOOGLE_PRIVATE_KEY',
+  'GOOGLE_CLIENT_EMAIL',
+  'GOOGLE_CLIENT_ID',
+}
+
+
+def _clean_env(value):
+  if value is None:
+    return None
+  return value.strip().strip('"').strip("'")
+
+
+def _parse_service_account_file(raw_config):
+  if set(raw_config.keys()) & SERVICE_ACCOUNT_KEYS:
+    return {k: v for k, v in raw_config.items() if k in SERVICE_ACCOUNT_KEYS}
+
+  if set(raw_config.keys()) & set(ENV_KEY_MAP.values()):
+    info = {}
+    for service_key, env_key in ENV_KEY_MAP.items():
+      value = _clean_env(raw_config.get(env_key))
+      if value:
+        info[service_key] = value
+    return info
+
+  return {}
+
+
+def _load_service_account_info(credentials_file):
+  env_info = {}
+  configured_env_keys = set()
+
+  for service_key, env_key in ENV_KEY_MAP.items():
+    value = _clean_env(os.getenv(env_key))
+    if value:
+      configured_env_keys.add(env_key)
+      env_info[service_key] = value
+
+  if configured_env_keys:
+    missing_required = sorted(REQUIRED_ENV_KEYS - configured_env_keys)
+    if missing_required:
+      raise ValueError(
+        'Missing required Google service account environment variables: '
+        + ', '.join(missing_required)
+      )
+
+    env_info.setdefault('type', 'service_account')
+    env_info.setdefault('auth_uri', 'https://accounts.google.com/o/oauth2/auth')
+    env_info.setdefault('token_uri', 'https://oauth2.googleapis.com/token')
+    env_info.setdefault('auth_provider_x509_cert_url', 'https://www.googleapis.com/oauth2/v1/certs')
+    env_info.setdefault('universe_domain', 'googleapis.com')
+    env_info['private_key'] = env_info['private_key'].replace('\\n', '\n')
+    return env_info
+
+  if not os.path.exists(credentials_file):
+    raise FileNotFoundError(
+      'Google credentials not found. Set GOOGLE_* environment variables '
+      'or provide database/sheets/credentials.json.'
+    )
+
+  with open(credentials_file, 'r', encoding='utf-8') as f:
+    raw_config = json.load(f)
+
+  service_account_info = _parse_service_account_file(raw_config)
+  if not service_account_info:
+    raise ValueError(
+      'Invalid credentials.json format. Use service-account JSON keys '
+      'or GOOGLE_* key names.'
+    )
+
+  if 'private_key' in service_account_info:
+    service_account_info['private_key'] = service_account_info['private_key'].replace('\\n', '\n')
+
+  return service_account_info
 
 class GoogleSheets:
   def __init__(self, spreadsheet_id):
     credentials_file = os.path.join(os.path.dirname(__file__), 'credentials.json')
-
-    with open(credentials_file, 'r', encoding='utf-8') as f:
-      raw_config = json.load(f)
-
-    service_account_keys = {
-      'type',
-      'project_id',
-      'private_key_id',
-      'private_key',
-      'client_email',
-      'client_id',
-      'auth_uri',
-      'token_uri',
-      'auth_provider_x509_cert_url',
-      'client_x509_cert_url',
-      'universe_domain',
-    }
-    service_account_info = {
-      k: v for k, v in raw_config.items() if k in service_account_keys
-    }
+    service_account_info = _load_service_account_info(credentials_file)
     scopes = [
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/drive.metadata.readonly',

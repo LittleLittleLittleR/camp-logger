@@ -1,0 +1,22 @@
+services:
+  telegram-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: camp-logger-telegram
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    command:
+      - -m
+      - uvicorn
+      - telegram.tele_main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+    restart: unless-stopped
