@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
 
 from database.SQLite.execute import DB_PATH, list_tables, read_table
-from .model import TelegramUpdate
+from .model import TelegramCallbackQuery, TelegramUpdate
 
 load_dotenv()
 logger = logging.getLogger("telegram.webhook")
@@ -81,12 +81,48 @@ async def _call_telegram_api(
 	return data
 
 
-async def _send_telegram_message(chat_id: int, text: str) -> dict[str, Any]:
+async def _send_telegram_message(
+	chat_id: int,
+	text: str,
+	reply_markup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
 	payload = {
 		"chat_id": chat_id,
 		"text": text,
 	}
+	if reply_markup is not None:
+		payload["reply_markup"] = reply_markup
 	return await _call_telegram_api("sendMessage", payload=payload)
+
+
+async def _edit_telegram_message(
+	chat_id: int,
+	message_id: int,
+	text: str,
+	reply_markup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+	payload: dict[str, Any] = {
+		"chat_id": chat_id,
+		"message_id": message_id,
+		"text": text,
+	}
+	if reply_markup is not None:
+		payload["reply_markup"] = reply_markup
+	return await _call_telegram_api("editMessageText", payload=payload)
+
+
+async def _answer_callback_query(
+	callback_query_id: str,
+	text: str | None = None,
+	show_alert: bool = False,
+) -> dict[str, Any]:
+	payload: dict[str, Any] = {
+		"callback_query_id": callback_query_id,
+		"show_alert": show_alert,
+	}
+	if text is not None:
+		payload["text"] = text
+	return await _call_telegram_api("answerCallbackQuery", payload=payload)
 
 
 def _build_webhook_url(base_url: str) -> str:
@@ -188,6 +224,14 @@ async def _process_telegram_update(
 	if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
 		raise HTTPException(status_code=403, detail="Invalid Telegram secret header")
 
+	if update.callback_query:
+		logger.info(
+			"Webhook callback received: update_id=%s data=%s",
+			update.update_id,
+			update.callback_query.data,
+		)
+		return await _handle_callback_query(update.callback_query)
+
 	message = update.message
 	if not message or not message.text:
 		logger.info("Webhook update ignored: update_id=%s reason=no-text", update.update_id)
@@ -202,16 +246,67 @@ async def _process_telegram_update(
 
 	reply = _handle_text_command(message.text)
 
-	# If handler returned a photo payload, send the photo; otherwise send as text.
-	if isinstance(reply, dict) and reply.get("photo"):
-		image_bytes = reply.get("photo")
-		caption = reply.get("caption")
-		await _send_telegram_photo(chat_id=message.chat.id, image_bytes=image_bytes, caption=caption)
-	else:
-		# Ensure it's string
-		text_to_send = str(reply) if reply is not None else ""
-		await _send_telegram_message(chat_id=message.chat.id, text=text_to_send)
+	await _send_bot_reply(message.chat.id, reply)
 	return {"ok": True, "handled": True}
+
+
+async def _handle_callback_query(callback_query: TelegramCallbackQuery) -> dict[str, Any]:
+	data = callback_query.data or ""
+	message = callback_query.message
+
+	if data == "tables:back":
+		table_names = list_tables()
+		if not message:
+			await _answer_callback_query(callback_query.id)
+			return {"ok": True, "handled": True}
+
+		if not table_names:
+			await _edit_telegram_message(message.chat.id, message.message_id, "No tables found.")
+			await _answer_callback_query(callback_query.id)
+			return {"ok": True, "handled": True}
+
+		await _edit_telegram_message(
+			message.chat.id,
+			message.message_id,
+			"Choose a table:",
+			_table_list_keyboard(table_names),
+		)
+		await _answer_callback_query(callback_query.id)
+		return {"ok": True, "handled": True}
+
+	if data.startswith("table:select:"):
+		table_name = data[len("table:select:") :]
+		if not message:
+			await _answer_callback_query(callback_query.id)
+			return {"ok": True, "handled": True}
+
+		if table_name not in list_tables():
+			await _edit_telegram_message(message.chat.id, message.message_id, f"Table '{table_name}' does not exist.")
+			await _answer_callback_query(callback_query.id, text="Table not found", show_alert=True)
+			return {"ok": True, "handled": True}
+
+		await _edit_telegram_message(
+			message.chat.id,
+			message.message_id,
+			f"Table selected: {table_name}\nChoose an action:",
+			_table_action_keyboard(table_name),
+		)
+		await _answer_callback_query(callback_query.id)
+		return {"ok": True, "handled": True}
+
+	if data.startswith("table:get:"):
+		table_name = data[len("table:get:") :]
+		reply = _table_contents_reply(table_name)
+		if message:
+			await _answer_callback_query(callback_query.id)
+			await _send_bot_reply(message.chat.id, reply)
+			return {"ok": True, "handled": True}
+
+		await _answer_callback_query(callback_query.id)
+		return {"ok": True, "handled": True}
+
+	await _answer_callback_query(callback_query.id)
+	return {"ok": True, "handled": False, "reason": "Unsupported callback data"}
 
 
 def _help_text() -> str:
@@ -219,7 +314,7 @@ def _help_text() -> str:
 		"Available commands:\n"
 		"/start - basic intro\n"
 		"/help - show commands\n"
-		"/tables - list SQLite tables\n"
+		"/tables - choose a table from buttons\n"
 		"/table <name> - show rows"
 	)
 
@@ -375,6 +470,63 @@ async def _send_telegram_photo(chat_id: int, image_bytes: bytes, filename: str =
 	return data
 
 
+def _table_list_keyboard(table_names: list[str]) -> dict[str, Any]:
+	return {
+		"inline_keyboard": [
+			[{"text": table_name, "callback_data": f"table:select:{table_name}"}]
+			for table_name in table_names
+		],
+	}
+
+
+def _table_action_keyboard(table_name: str) -> dict[str, Any]:
+	return {
+		"inline_keyboard": [
+			[{"text": "Get table", "callback_data": f"table:get:{table_name}"}],
+			[{"text": "Back to tables", "callback_data": "tables:back"}],
+		],
+	}
+
+
+def _table_contents_reply(table_name: str) -> Any:
+	if table_name not in list_tables():
+		return f"Table '{table_name}' does not exist."
+
+	columns, rows = read_table(table_name)
+	if not rows:
+		return f"Table '{table_name}' exists but has no rows."
+
+	# Render image and instruct caller to send a photo to Telegram.
+	# Cap rows for image rendering to avoid extremely large images.
+	max_rows_for_image = 500
+	rows_for_image = rows[:max_rows_for_image]
+	try:
+		img_bytes = _render_table_image(columns, rows_for_image)
+	except Exception as exc:
+		# Fall back to text reply if image rendering is not available.
+		logger.exception("Image rendering failed for table %s: %s", table_name, exc)
+		return f"{table_name} ({len(rows)} rows) — unable to render image: {exc}"
+
+	caption = f"{table_name} ({len(rows)} rows)"
+	return {"photo": img_bytes, "caption": caption}
+
+
+async def _send_bot_reply(chat_id: int, reply: Any) -> dict[str, Any]:
+	if isinstance(reply, dict):
+		if reply.get("photo"):
+			return await _send_telegram_photo(
+				chat_id=chat_id,
+				image_bytes=reply["photo"],
+				caption=reply.get("caption"),
+			)
+
+		text = str(reply.get("text", ""))
+		reply_markup = reply.get("reply_markup")
+		return await _send_telegram_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+	return await _send_telegram_message(chat_id=chat_id, text=str(reply))
+
+
 def _handle_text_command(text: str) -> Any:
 	lowered = text.strip().lower()
 
@@ -386,32 +538,20 @@ def _handle_text_command(text: str) -> Any:
 
 	if lowered.startswith("/tables"):
 		tables = list_tables()
-		return "Tables:\n" + "\n".join(tables) if tables else "No tables found."
+		if not tables:
+			return "No tables found."
+
+		return {
+			"text": "Choose a table:",
+			"reply_markup": _table_list_keyboard(tables),
+		}
 
 	if lowered.startswith("/table"):
 		parts = text.split(maxsplit=1)
 		if len(parts) < 2:
 			return "Usage: /table <table_name>"
 		table_name = parts[1].strip()
-		if table_name not in list_tables():
-			return f"Table '{table_name}' does not exist."
-		columns, rows = read_table(table_name)
-		if not rows:
-			return f"Table '{table_name}' exists but has no rows."
-
-		# Render image and instruct caller to send a photo to Telegram.
-		# Cap rows for image rendering to avoid extremely large images.
-		max_rows_for_image = 500
-		rows_for_image = rows[:max_rows_for_image]
-		try:
-			img_bytes = _render_table_image(columns, rows_for_image)
-		except Exception as exc:
-			# Fall back to text reply if image rendering is not available
-			logger.exception("Image rendering failed for table %s: %s", table_name, exc)
-			return f"{table_name} ({len(rows)} rows) — unable to render image: {exc}"
-
-		caption = f"{table_name} ({len(rows)} rows)"
-		return {"photo": img_bytes, "caption": caption}
+		return _table_contents_reply(table_name)
 
 	return "Unknown command. Use /help."
 

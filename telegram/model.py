@@ -11,6 +11,13 @@ class TelegramMessage(BaseModel):
 	chat: TelegramChat
 
 
+class TelegramCallbackQuery(BaseModel):
+	id: str
+	data: str | None = None
+	message: TelegramMessage | None = None
+
+
 class TelegramUpdate(BaseModel):
 	update_id: int
 	message: TelegramMessage | None = None
+	callback_query: TelegramCallbackQuery | None = None
