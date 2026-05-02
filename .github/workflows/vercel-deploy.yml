@@ -1,13 +1,48 @@
-name: Deploy to Vercel (Production)
+name: CI and Deploy to Vercel (Production)
 
 on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
+concurrency:
+  group: vercel-production-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate Python dependency graph
+        run: pip check
+
+      - name: Static compile check
+        run: python -m compileall -q api telegram database
+
+      - name: App smoke check
+        run: python scripts/ci_smoke.py
+
   deploy:
+    needs: ci
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -56,5 +91,8 @@ jobs:
       - name: Pull Vercel environment
         run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
 
-      - name: Deploy to production
-        run: vercel deploy --prod --yes --token="$VERCEL_TOKEN"
+      - name: Build on CI using Vercel
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+
+      - name: Deploy prebuilt output to production
+        run: vercel deploy --prebuilt --prod --yes --token="$VERCEL_TOKEN"

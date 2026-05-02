@@ -1,10 +1,14 @@
 import os
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 import io
-from PIL import Image, ImageDraw, ImageFont
+try:
+	from PIL import Image, ImageDraw, ImageFont
+	PIL_AVAILABLE = True
+except Exception:
+	PIL_AVAILABLE = False
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
 
@@ -240,6 +244,9 @@ def _table_preview(table_name: str, limit: int = 5) -> str:
 
 
 def _render_table_image(columns: list[str], rows: list[tuple]) -> bytes:
+	if not PIL_AVAILABLE:
+		raise RuntimeError("Pillow library is not available. Install Pillow to enable image rendering.")
+
 	# Render a simple table image using Pillow
 	font = ImageFont.load_default()
 	padding = 8
@@ -345,7 +352,13 @@ def _handle_text_command(text: str) -> Any:
 		# Cap rows for image rendering to avoid extremely large images.
 		max_rows_for_image = 500
 		rows_for_image = rows[:max_rows_for_image]
-		img_bytes = _render_table_image(columns, rows_for_image)
+		try:
+			img_bytes = _render_table_image(columns, rows_for_image)
+		except Exception as exc:
+			# Fall back to text reply if image rendering is not available
+			logger.exception("Image rendering failed for table %s: %s", table_name, exc)
+			return f"{table_name} ({len(rows)} rows) — unable to render image: {exc}"
+
 		caption = f"{table_name} ({len(rows)} rows)"
 		return {"photo": img_bytes, "caption": caption}
 
@@ -372,25 +385,31 @@ def get_tables() -> dict[str, list[str]]:
 
 
 @app.get("/api/table/{table_name}")
-def get_table_data(table_name: str, limit: int | None = Query(default=None)) -> dict[str, Any]:
-	if table_name not in list_tables():
-		raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
+def get_table_data(table_name: str, limit: Optional[int] = Query(default=None)) -> dict[str, Any]:
+	try:
+		if table_name not in list_tables():
+			raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
 
-	columns, rows = read_table(table_name)
-	if limit is None:
-		selected_rows = rows
-	else:
-		if limit < 1:
-			raise HTTPException(status_code=400, detail="limit must be >= 1")
-		selected_rows = rows[:limit]
+		columns, rows = read_table(table_name)
+		if limit is None:
+			selected_rows = rows
+		else:
+			if limit < 1:
+				raise HTTPException(status_code=400, detail="limit must be >= 1")
+			selected_rows = rows[:limit]
 
-	records = [dict(zip(columns, row)) for row in selected_rows]
-	return {
-		"table": table_name,
-		"count": len(records),
-		"total_rows": len(rows),
-		"records": records,
-	}
+		records = [dict(zip(columns, row)) for row in selected_rows]
+		return {
+			"table": table_name,
+			"count": len(records),
+			"total_rows": len(rows),
+			"records": records,
+		}
+	except HTTPException:
+		raise
+	except Exception as exc:
+		logger.exception("Failed to read table %s", table_name)
+		raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/telegram/webhook/{secret}")
