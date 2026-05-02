@@ -247,13 +247,17 @@ def _render_table_image(columns: list[str], rows: list[tuple]) -> bytes:
 	if not PIL_AVAILABLE:
 		raise RuntimeError("Pillow library is not available. Install Pillow to enable image rendering.")
 
-	# Render a simple table image using Pillow.
-	font = ImageFont.load_default()
+	# High-resolution table renderer tuned for Telegram readability.
+	# The layout wraps long cell text and keeps width bounded to avoid client downscaling blur.
+	try:
+		font = ImageFont.truetype("DejaVuSansMono.ttf", size=26)
+	except Exception:
+		font = ImageFont.load_default()
+
 	tmp_img = Image.new("RGB", (1, 1), "white")
 	tmp_draw = ImageDraw.Draw(tmp_img)
 
 	def _measure_text(text: str) -> tuple[int, int]:
-		# Pillow 10+ removed getsize; textbbox/getbbox are the stable options.
 		try:
 			left, top, right, bottom = tmp_draw.textbbox((0, 0), text, font=font)
 			return max(1, right - left), max(1, bottom - top)
@@ -261,56 +265,134 @@ def _render_table_image(columns: list[str], rows: list[tuple]) -> bytes:
 			left, top, right, bottom = font.getbbox(text)
 			return max(1, right - left), max(1, bottom - top)
 
-	padding = 8
-	_, base_text_height = _measure_text("Ay")
+	def _wrap_text(value: str, max_pixel_width: int, max_lines: int = 4) -> list[str]:
+		words = value.split()
+		if not words:
+			return [""]
+
+		lines: list[str] = []
+		current = ""
+		for word in words:
+			candidate = word if not current else f"{current} {word}"
+			if _measure_text(candidate)[0] <= max_pixel_width:
+				current = candidate
+				continue
+
+			if current:
+				lines.append(current)
+				current = word
+			else:
+				# If single word is too long, hard-split it by characters.
+				chunk = ""
+				for ch in word:
+					candidate_chunk = f"{chunk}{ch}"
+					if _measure_text(candidate_chunk)[0] <= max_pixel_width:
+						chunk = candidate_chunk
+					else:
+						lines.append(chunk)
+						chunk = ch
+				if chunk:
+					current = chunk
+
+		if current:
+			lines.append(current)
+
+		if len(lines) > max_lines:
+			kept = lines[:max_lines]
+			last = kept[-1]
+			ellipsis = "..."
+			while last and _measure_text(f"{last}{ellipsis}")[0] > max_pixel_width:
+				last = last[:-1]
+			kept[-1] = f"{last}{ellipsis}" if last else ellipsis
+			return kept
+
+		return lines
+
+	padding_x = 14
+	padding_y = 10
+	cell_max_text_width = 460
+	_, base_text_height = _measure_text("Ag")
 	line_height = base_text_height + 6
 
-	# Compute column widths
-	col_widths = [_measure_text(str(col))[0] for col in columns]
+	# Prepare wrapped text per cell to keep the image dimensions controlled.
+	wrapped_rows: list[list[list[str]]] = []
 	for row in rows:
+		wrapped_row: list[list[str]] = []
 		for i, cell in enumerate(row):
 			text = "" if cell is None else str(cell)
-			w, _ = _measure_text(text)
-			if w > col_widths[i]:
-				col_widths[i] = w
+			wrapped_row.append(_wrap_text(text, max_pixel_width=cell_max_text_width))
+		wrapped_rows.append(wrapped_row)
 
-	# Add padding to widths
-	col_widths = [w + padding * 2 for w in col_widths]
+	# Compute column widths based on header + wrapped cell content.
+	col_widths: list[int] = []
+	for i, col in enumerate(columns):
+		header_w = _measure_text(str(col))[0]
+		col_w = header_w
+		for wrapped_row in wrapped_rows:
+			for line in wrapped_row[i]:
+				line_w = _measure_text(line)[0]
+				if line_w > col_w:
+					col_w = line_w
+		col_widths.append(min(cell_max_text_width, col_w) + padding_x * 2)
+
+	# Row heights are dynamic because cells can wrap to multiple lines.
+	header_height = line_height + padding_y * 2
+	row_heights: list[int] = []
+	for wrapped_row in wrapped_rows:
+		max_lines_in_row = max(len(cell_lines) for cell_lines in wrapped_row)
+		row_heights.append(max_lines_in_row * line_height + padding_y * 2)
 
 	table_width = sum(col_widths)
-	table_height = line_height * (len(rows) + 1) + padding * 2
+	table_height = header_height + sum(row_heights)
 
-	img = Image.new("RGB", (table_width, max(table_height, 32)), "white")
+	img = Image.new("RGB", (max(table_width, 64), max(table_height, 64)), "white")
 	draw = ImageDraw.Draw(img)
 
-	# Draw header
+	# Header
 	x = 0
-	y = padding
+	y = 0
 	for i, col in enumerate(columns):
-		draw.rectangle([x, y, x + col_widths[i], y + line_height], fill=(230, 230, 230))
-		draw.text((x + padding, y + 2), str(col), fill="black", font=font)
+		draw.rectangle([x, y, x + col_widths[i], y + header_height], fill=(242, 244, 247))
+		draw.text((x + padding_x, y + padding_y), str(col), fill=(20, 24, 32), font=font)
 		x += col_widths[i]
 
-	# Draw rows
-	y += line_height
-	for row in rows:
-		x = 0
-		for i, cell in enumerate(row):
-			text = "" if cell is None else str(cell)
-			draw.text((x + padding, y + 2), text, fill="black", font=font)
-			x += col_widths[i]
-		y += line_height
+	# Body with zebra striping
+	y = header_height
+	for row_index, wrapped_row in enumerate(wrapped_rows):
+		row_h = row_heights[row_index]
+		if row_index % 2 == 1:
+			draw.rectangle([0, y, table_width, y + row_h], fill=(249, 250, 252))
 
-	# Draw vertical grid lines
+		x = 0
+		for i, cell_lines in enumerate(wrapped_row):
+			for line_index, line in enumerate(cell_lines):
+				draw.text(
+					(x + padding_x, y + padding_y + line_index * line_height),
+					line,
+					fill=(33, 37, 41),
+					font=font,
+				)
+			x += col_widths[i]
+		y += row_h
+
+	# Grid lines
+	grid = (210, 214, 220)
 	x = 0
 	for w in col_widths:
-		draw.line([(x, padding), (x, y)], fill=(200, 200, 200))
+		draw.line([(x, 0), (x, table_height)], fill=grid, width=1)
 		x += w
-	draw.line([(x - 1, padding), (x - 1, y)], fill=(200, 200, 200))
+	draw.line([(x - 1, 0), (x - 1, table_height)], fill=grid, width=1)
 
-	# Save to bytes
+	y = 0
+	draw.line([(0, y), (table_width, y)], fill=grid, width=1)
+	y += header_height
+	draw.line([(0, y), (table_width, y)], fill=grid, width=1)
+	for row_h in row_heights:
+		y += row_h
+		draw.line([(0, y), (table_width, y)], fill=grid, width=1)
+
 	buf = io.BytesIO()
-	img.save(buf, format="PNG")
+	img.save(buf, format="PNG", optimize=False)
 	buf.seek(0)
 	return buf.read()
 
