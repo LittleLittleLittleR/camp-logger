@@ -3,6 +3,8 @@ import logging
 from typing import Any
 
 import httpx
+import io
+from PIL import Image, ImageDraw, ImageFont
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
 
@@ -194,8 +196,17 @@ async def _process_telegram_update(
 		message.text,
 	)
 
-	reply_text = _handle_text_command(message.text)
-	await _send_telegram_message(chat_id=message.chat.id, text=reply_text)
+	reply = _handle_text_command(message.text)
+
+	# If handler returned a photo payload, send the photo; otherwise send as text.
+	if isinstance(reply, dict) and reply.get("photo"):
+		image_bytes = reply.get("photo")
+		caption = reply.get("caption")
+		await _send_telegram_photo(chat_id=message.chat.id, image_bytes=image_bytes, caption=caption)
+	else:
+		# Ensure it's string
+		text_to_send = str(reply) if reply is not None else ""
+		await _send_telegram_message(chat_id=message.chat.id, text=text_to_send)
 	return {"ok": True, "handled": True}
 
 
@@ -205,7 +216,7 @@ def _help_text() -> str:
 		"/start - basic intro\n"
 		"/help - show commands\n"
 		"/tables - list SQLite tables\n"
-		"/table <name> - preview first 5 rows"
+		"/table <name> - show rows"
 	)
 
 
@@ -217,6 +228,7 @@ def _table_preview(table_name: str, limit: int = 5) -> str:
 	if not rows:
 		return f"Table '{table_name}' exists but has no rows."
 
+	# By default show a short text preview; full data can be fetched via the API.
 	shown_rows = rows[:limit]
 	lines: list[str] = [f"Preview of {table_name} (max {limit} rows):"]
 	lines.append(", ".join(columns))
@@ -227,7 +239,85 @@ def _table_preview(table_name: str, limit: int = 5) -> str:
 	return "\n".join(lines)
 
 
-def _handle_text_command(text: str) -> str:
+def _render_table_image(columns: list[str], rows: list[tuple]) -> bytes:
+	# Render a simple table image using Pillow
+	font = ImageFont.load_default()
+	padding = 8
+	line_height = font.getsize("Ay")[1] + 6
+
+	# Compute column widths
+	col_widths = [font.getsize(col)[0] for col in columns]
+	for row in rows:
+		for i, cell in enumerate(row):
+			text = "" if cell is None else str(cell)
+			w = font.getsize(text)[0]
+			if w > col_widths[i]:
+				col_widths[i] = w
+
+	# Add padding to widths
+	col_widths = [w + padding * 2 for w in col_widths]
+
+	table_width = sum(col_widths)
+	table_height = line_height * (len(rows) + 1) + padding * 2
+
+	img = Image.new("RGB", (table_width, max(table_height, 32)), "white")
+	draw = ImageDraw.Draw(img)
+
+	# Draw header
+	x = 0
+	y = padding
+	for i, col in enumerate(columns):
+		draw.rectangle([x, y, x + col_widths[i], y + line_height], fill=(230, 230, 230))
+		draw.text((x + padding, y + 2), str(col), fill="black", font=font)
+		x += col_widths[i]
+
+	# Draw rows
+	y += line_height
+	for row in rows:
+		x = 0
+		for i, cell in enumerate(row):
+			text = "" if cell is None else str(cell)
+			draw.text((x + padding, y + 2), text, fill="black", font=font)
+			x += col_widths[i]
+		y += line_height
+
+	# Draw vertical grid lines
+	x = 0
+	for w in col_widths:
+		draw.line([(x, padding), (x, y)], fill=(200, 200, 200))
+		x += w
+	draw.line([(x - 1, padding), (x - 1, y)], fill=(200, 200, 200))
+
+	# Save to bytes
+	buf = io.BytesIO()
+	img.save(buf, format="PNG")
+	buf.seek(0)
+	return buf.read()
+
+
+async def _send_telegram_photo(chat_id: int, image_bytes: bytes, filename: str = "table.png", caption: str | None = None) -> dict[str, Any]:
+	url = _build_telegram_api_url("sendPhoto")
+
+	data = {"chat_id": str(chat_id)}
+	if caption:
+		data["caption"] = caption
+
+	files = {"photo": (filename, image_bytes, "image/png")}
+
+	async with httpx.AsyncClient(timeout=TELEGRAM_TIMEOUT_SECONDS) as client:
+		response = await client.post(url, data=data, files=files)
+
+	if response.status_code >= 400:
+		raise HTTPException(status_code=502, detail=f"Telegram sendPhoto failed: {response.text}")
+
+	data = response.json()
+	if not data.get("ok", False):
+		raise HTTPException(status_code=502, detail=f"Telegram sendPhoto not ok: {data}")
+
+	return data
+
+
+def _handle_text_command(text: str) -> Any:
 	lowered = text.strip().lower()
 
 	if lowered.startswith("/start"):
@@ -244,7 +334,20 @@ def _handle_text_command(text: str) -> str:
 		parts = text.split(maxsplit=1)
 		if len(parts) < 2:
 			return "Usage: /table <table_name>"
-		return _table_preview(parts[1].strip())
+		table_name = parts[1].strip()
+		if table_name not in list_tables():
+			return f"Table '{table_name}' does not exist."
+		columns, rows = read_table(table_name)
+		if not rows:
+			return f"Table '{table_name}' exists but has no rows."
+
+		# Render image and instruct caller to send a photo to Telegram.
+		# Cap rows for image rendering to avoid extremely large images.
+		max_rows_for_image = 500
+		rows_for_image = rows[:max_rows_for_image]
+		img_bytes = _render_table_image(columns, rows_for_image)
+		caption = f"{table_name} ({len(rows)} rows)"
+		return {"photo": img_bytes, "caption": caption}
 
 	return "Unknown command. Use /help."
 
@@ -269,15 +372,23 @@ def get_tables() -> dict[str, list[str]]:
 
 
 @app.get("/api/table/{table_name}")
-def get_table_data(table_name: str, limit: int = Query(default=100, ge=1, le=1000)) -> dict[str, Any]:
+def get_table_data(table_name: str, limit: int | None = Query(default=None)) -> dict[str, Any]:
 	if table_name not in list_tables():
 		raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
 
 	columns, rows = read_table(table_name)
-	records = [dict(zip(columns, row)) for row in rows[:limit]]
+	if limit is None:
+		selected_rows = rows
+	else:
+		if limit < 1:
+			raise HTTPException(status_code=400, detail="limit must be >= 1")
+		selected_rows = rows[:limit]
+
+	records = [dict(zip(columns, row)) for row in selected_rows]
 	return {
 		"table": table_name,
 		"count": len(records),
+		"total_rows": len(rows),
 		"records": records,
 	}
 
