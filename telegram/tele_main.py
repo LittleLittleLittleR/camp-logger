@@ -247,17 +247,30 @@ def _render_table_image(columns: list[str], rows: list[tuple]) -> bytes:
 	if not PIL_AVAILABLE:
 		raise RuntimeError("Pillow library is not available. Install Pillow to enable image rendering.")
 
-	# Render a simple table image using Pillow
+	# Render a simple table image using Pillow.
 	font = ImageFont.load_default()
+	tmp_img = Image.new("RGB", (1, 1), "white")
+	tmp_draw = ImageDraw.Draw(tmp_img)
+
+	def _measure_text(text: str) -> tuple[int, int]:
+		# Pillow 10+ removed getsize; textbbox/getbbox are the stable options.
+		try:
+			left, top, right, bottom = tmp_draw.textbbox((0, 0), text, font=font)
+			return max(1, right - left), max(1, bottom - top)
+		except Exception:
+			left, top, right, bottom = font.getbbox(text)
+			return max(1, right - left), max(1, bottom - top)
+
 	padding = 8
-	line_height = font.getsize("Ay")[1] + 6
+	_, base_text_height = _measure_text("Ay")
+	line_height = base_text_height + 6
 
 	# Compute column widths
-	col_widths = [font.getsize(col)[0] for col in columns]
+	col_widths = [_measure_text(str(col))[0] for col in columns]
 	for row in rows:
 		for i, cell in enumerate(row):
 			text = "" if cell is None else str(cell)
-			w = font.getsize(text)[0]
+			w, _ = _measure_text(text)
 			if w > col_widths[i]:
 				col_widths[i] = w
 

@@ -4,3 +4,7 @@ credentials.json
 */**/credentials.json
 .vercel
 .env*.local
+
+# Python cache artifacts
+__pycache__/
+*.pyc
