@@ -1,4 +1,5 @@
 import os
+import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -45,6 +46,17 @@ def _is_external_edit(last_modified, python_last_write):
 
   return last_modified > (python_last_write + timedelta(seconds=INTERNAL_WRITE_SKEW_SECONDS))
 
+
+def _classify_edit_source(last_modified, python_last_write):
+  """Classify the latest edit source as external/internal_sync/none/unknown."""
+  if not last_modified:
+    return 'none'
+  if not python_last_write:
+    return 'external_or_unknown'
+  if _is_external_edit(last_modified, python_last_write):
+    return 'external'
+  return 'internal_sync'
+
 class DatabaseManager:
   def __init__(self):
     self.sheet_id = _clean_env(os.getenv("SHEET_ID"))
@@ -86,27 +98,44 @@ class DatabaseManager:
 
   def write_to_database(self):
     """Import every Google Sheets tab into SQLite, replacing each table entirely."""
+    if not self.database_path.exists():
+      raise FileNotFoundError(f"SQLite database not found: {self.database_path}")
+
     imported_tables = []
+    backup_path = self.database_path.with_suffix(f"{self.database_path.suffix}.bak")
 
-    for table in self.google_sheets.read_all_sheets():
-      columns = table['columns']
-      rows = table['rows']
-      sheet_name = table['sheetName']
+    shutil.copy2(self.database_path, backup_path)
 
-      if not columns:
-        continue
+    try:
+      for table in self.google_sheets.read_all_sheets():
+        columns = table['columns']
+        rows = table['rows']
+        sheet_name = table['sheetName']
 
-      replace_table(sheet_name, columns, rows)
+        if not columns:
+          continue
 
-      imported_tables.append({
-        'tableName': sheet_name,
-        'sheetName': sheet_name,
-        'rowsWritten': len(rows),
-      })
+        replace_table(sheet_name, columns, rows)
 
-    set_sync_meta('sqlite_python_last_write_ts', get_db_last_modified_timestamp())
+        imported_tables.append({
+          'tableName': sheet_name,
+          'sheetName': sheet_name,
+          'rowsWritten': len(rows),
+        })
 
-    return imported_tables
+      set_sync_meta('sqlite_python_last_write_ts', get_db_last_modified_timestamp())
+
+      return imported_tables
+    except Exception:
+      # Restore the previous DB snapshot to avoid partial table replacement corruption.
+      shutil.copy2(backup_path, self.database_path)
+      raise
+    finally:
+      try:
+        if backup_path.exists():
+          backup_path.unlink()
+      except OSError:
+        pass
 
   def compare_versions(self):
     """
@@ -129,6 +158,9 @@ class DatabaseManager:
     sheets_python_last_write = _parse_iso(sheets_python_last_write_ts)
     sqlite_python_last_write = _parse_iso(sqlite_python_last_write_ts)
 
+    sheets_edit_source = _classify_edit_source(sheets_last_modified, sheets_python_last_write)
+    sqlite_edit_source = _classify_edit_source(sqlite_last_modified, sqlite_python_last_write)
+
     sheets_external_last_edit_ts = (
       sheets_last_modified_ts
       if _is_external_edit(sheets_last_modified, sheets_python_last_write)
@@ -146,10 +178,14 @@ class DatabaseManager:
     )
 
     return {
+      'sheets_last_modified_ts': sheets_last_modified_ts,
+      'sqlite_last_modified_ts': sqlite_last_modified_ts,
       'sheets_external_last_edit_ts': sheets_external_last_edit_ts,
       'sqlite_external_last_edit_ts': sqlite_external_last_edit_ts,
       'sheets_python_last_write_ts': sheets_python_last_write_ts,
       'sqlite_python_last_write_ts': sqlite_python_last_write_ts,
+      'sheets_edit_source': sheets_edit_source,
+      'sqlite_edit_source': sqlite_edit_source,
       'verdict': verdict,
     }
 

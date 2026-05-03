@@ -559,9 +559,17 @@ def _handle_text_command(text: str) -> Any:
 			verdict = comparison.get("verdict")
 			se = comparison.get("sheets_external_last_edit_ts")
 			db = comparison.get("sqlite_external_last_edit_ts")
+			sheets_source = comparison.get("sheets_edit_source")
+			sqlite_source = comparison.get("sqlite_edit_source")
+			sheets_write = comparison.get("sheets_python_last_write_ts")
+			sqlite_write = comparison.get("sqlite_python_last_write_ts")
 			return (
 				"Sync status:\n"
 				f"Verdict: {verdict}\n"
+				f"Sheets source: {sheets_source}\n"
+				f"SQLite source: {sqlite_source}\n"
+				f"Sheets last sync write: {sheets_write}\n"
+				f"SQLite last sync write: {sqlite_write}\n"
 				f"Sheets external edit: {se}\n"
 				f"SQLite external edit: {db}\n"
 			)
