@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
 
 from database.SQLite.execute import DB_PATH, list_tables, read_table
+from database.database_main import DatabaseManager
 from .model import TelegramCallbackQuery, TelegramUpdate
 
 load_dotenv()
@@ -686,6 +687,74 @@ async def delete_webhook(drop_pending_updates: bool = False) -> dict[str, Any]:
 		"ok": True,
 		"telegram": data,
 	}
+
+
+@app.get("/sync/status")
+def sync_status() -> dict[str, Any]:
+	"""Check the sync status between Google Sheets and the SQLite database without making changes."""
+	try:
+		manager = DatabaseManager()
+		comparison = manager.compare_versions()
+		return {
+			"ok": True,
+			"status": comparison,
+		}
+	except Exception as exc:
+		logger.exception("Failed to get sync status")
+		raise HTTPException(status_code=500, detail=f"Sync status check failed: {str(exc)}") from exc
+
+
+@app.post("/sync")
+def sync_databases(action: str = "auto") -> dict[str, Any]:
+	"""
+	Sync Google Sheets and SQLite database.
+	
+	Parameters:
+	  action: "auto" (default) - compare versions and sync automatically based on external edits
+	          "sheets_to_db" - force import all sheets into database
+	          "db_to_sheets" - force export all database tables to sheets
+	"""
+	try:
+		manager = DatabaseManager()
+
+		if action == "auto":
+			result = manager.compare_and_sync()
+			return {
+				"ok": True,
+				"action": result.get("action"),
+				"verdict": result.get("verdict"),
+				"sync_result": result.get("sync_result"),
+				"sheets_external_last_edit_ts": result.get("sheets_external_last_edit_ts"),
+				"sqlite_external_last_edit_ts": result.get("sqlite_external_last_edit_ts"),
+			}
+
+		elif action == "sheets_to_db":
+			result = manager.write_to_database()
+			return {
+				"ok": True,
+				"action": "sheets_to_db",
+				"sync_result": result,
+			}
+
+		elif action == "db_to_sheets":
+			result = manager.write_to_sheet()
+			return {
+				"ok": True,
+				"action": "db_to_sheets",
+				"sync_result": result,
+			}
+
+		else:
+			raise HTTPException(
+				status_code=400,
+				detail=f"Invalid action '{action}'. Must be one of: auto, sheets_to_db, db_to_sheets",
+			)
+
+	except HTTPException:
+		raise
+	except Exception as exc:
+		logger.exception("Sync operation failed with action=%s", action)
+		raise HTTPException(status_code=500, detail=f"Sync failed: {str(exc)}") from exc
 
 
 if __name__ == "__main__":
