@@ -312,11 +312,15 @@ async def _handle_callback_query(callback_query: TelegramCallbackQuery) -> dict[
 
 def _help_text() -> str:
 	return (
-		"Available commands:\n"
-		"/start - basic intro\n"
-		"/help - show commands\n"
-		"/tables - choose a table from buttons\n"
-		"/table <name> - show rows"
+		"Camp Logger Bot\n\n"
+		"Commands:\n"
+		"/start - Welcome message\n"
+		"/help - Show this help menu\n\n"
+		"Table Options:\n"
+		"/tables - Browse tables\n\n"
+		"Sync Options:\n"
+		"/sync/status - Check if data needs updating\n"
+		"/sync - Update data (auto-sync from sheets or database)"
 	)
 
 
@@ -547,13 +551,6 @@ def _handle_text_command(text: str) -> Any:
 			"reply_markup": _table_list_keyboard(tables),
 		}
 
-	if lowered.startswith("/table"):
-		parts = text.split(maxsplit=1)
-		if len(parts) < 2:
-			return "Usage: /table <table_name>"
-		table_name = parts[1].strip()
-		return _table_contents_reply(table_name)
-
 	return "Unknown command. Use /help."
 
 
@@ -574,34 +571,6 @@ def health() -> dict[str, str]:
 @app.get("/api/tables")
 def get_tables() -> dict[str, list[str]]:
 	return {"tables": list_tables()}
-
-
-@app.get("/api/table/{table_name}")
-def get_table_data(table_name: str, limit: Optional[int] = Query(default=None)) -> dict[str, Any]:
-	try:
-		if table_name not in list_tables():
-			raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
-
-		columns, rows = read_table(table_name)
-		if limit is None:
-			selected_rows = rows
-		else:
-			if limit < 1:
-				raise HTTPException(status_code=400, detail="limit must be >= 1")
-			selected_rows = rows[:limit]
-
-		records = [dict(zip(columns, row)) for row in selected_rows]
-		return {
-			"table": table_name,
-			"count": len(records),
-			"total_rows": len(rows),
-			"records": records,
-		}
-	except HTTPException:
-		raise
-	except Exception as exc:
-		logger.exception("Failed to read table %s", table_name)
-		raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/telegram/webhook/{secret}")
