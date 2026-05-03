@@ -4,12 +4,14 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from .sheets.sheets_main import GoogleSheets
 from .SQLite.execute import (
+  DB_PATH,
   list_tables,
   read_table,
   replace_table,
   get_db_last_modified_timestamp,
   get_sync_meta,
   set_sync_meta,
+  resolve_db_path,
 )
 
 load_dotenv()
@@ -51,7 +53,7 @@ class DatabaseManager:
       raise ValueError("SHEET_ID must be set in .env")
 
     self.google_sheets = GoogleSheets(self.sheet_id)
-    self.database_path = Path(__file__).resolve().parents[1] / "database.db"
+    self.database_path = resolve_db_path()
 
   def read_from_google_sheets(self):
     """Read every worksheet tab as a table-like dataset."""

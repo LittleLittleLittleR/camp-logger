@@ -1,5 +1,8 @@
 import sqlite3
 import csv
+import os
+import shutil
+import tempfile
 from io import StringIO
 from pathlib import Path
 from datetime import datetime, timezone
@@ -8,8 +11,28 @@ DB_PATH = Path(__file__).resolve().parents[2] / 'database.db'
 SYNC_META_TABLE = '__sync_meta'
 
 
-def _connect(db_path=DB_PATH):
-  return sqlite3.connect(db_path)
+def resolve_db_path() -> Path:
+  """Return the SQLite database path, automatically using temp directory if the packaged DB is read-only."""
+  # If DB exists and is writable, use it directly
+  if DB_PATH.exists() and os.access(DB_PATH, os.W_OK):
+    return DB_PATH
+
+  # Fall back to temp directory (for Vercel/serverless read-only filesystems)
+  temp_db_path = Path(tempfile.gettempdir()) / DB_PATH.name
+
+  # Copy packaged DB to temp on first access if it doesn't exist there yet
+  if not temp_db_path.exists() and DB_PATH.exists():
+    try:
+      temp_db_path.parent.mkdir(parents=True, exist_ok=True)
+      shutil.copy2(DB_PATH, temp_db_path)
+    except Exception:
+      pass
+
+  return temp_db_path if temp_db_path.exists() else DB_PATH
+
+
+def _connect(db_path: Path | None = None):
+  return sqlite3.connect(db_path or resolve_db_path())
 
 
 def list_tables() -> list[str]:
@@ -25,10 +48,11 @@ def list_tables() -> list[str]:
 
 def get_db_last_modified_timestamp() -> str | None:
   """Return the database file last-modified timestamp in UTC ISO format."""
-  if not DB_PATH.exists():
+  db_path = resolve_db_path()
+  if not db_path.exists():
     return None
 
-  dt = datetime.fromtimestamp(DB_PATH.stat().st_mtime, tz=timezone.utc)
+  dt = datetime.fromtimestamp(db_path.stat().st_mtime, tz=timezone.utc)
   return dt.isoformat().replace('+00:00', 'Z')
 
 
