@@ -551,6 +551,53 @@ def _handle_text_command(text: str) -> Any:
 			"reply_markup": _table_list_keyboard(tables),
 		}
 
+	# Sync commands (Telegram)
+	if lowered.startswith("/sync/status"):
+		try:
+			manager = DatabaseManager()
+			comparison = manager.compare_versions()
+			verdict = comparison.get("verdict")
+			se = comparison.get("sheets_external_last_edit_ts")
+			db = comparison.get("sqlite_external_last_edit_ts")
+			return (
+				"Sync status:\n"
+				f"Verdict: {verdict}\n"
+				f"Sheets external edit: {se}\n"
+				f"SQLite external edit: {db}\n"
+			)
+		except Exception as exc:
+			logger.exception("Failed to get sync status via Telegram command")
+			return f"Sync status failed: {str(exc)}"
+
+	if lowered.startswith("/sync"):
+		# Allow optional action after command: /sync sheets_to_db or /sync db_to_sheets
+		parts = text.strip().split()
+		action = "auto"
+		if len(parts) > 1:
+			action = parts[1].strip().lower()
+
+		try:
+			manager = DatabaseManager()
+			if action == "auto":
+				result = manager.compare_and_sync()
+				return (
+					"Sync completed:\n"
+					f"Action: {result.get('action')}\n"
+					f"Verdict: {result.get('verdict')}\n"
+					f"Synced items: {len(result.get('sync_result', []))}\n"
+				)
+			elif action == "sheets_to_db":
+				res = manager.write_to_database()
+				return f"Import completed. Tables updated: {len(res)}"
+			elif action == "db_to_sheets":
+				res = manager.write_to_sheet()
+				return f"Export completed. Sheets updated: {len(res)}"
+			else:
+				return "Invalid sync action. Use: /sync, /sync sheets_to_db, /sync db_to_sheets"
+		except Exception as exc:
+			logger.exception("Sync operation failed via Telegram command: %s", action)
+			return f"Sync failed: {str(exc)}"
+
 	return "Unknown command. Use /help."
 
 
